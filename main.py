@@ -5,8 +5,8 @@ Pure-stdlib Python that paints a newspaper front page summing up the
 world news of Tuesday, 24 November 2026 as a single 1024x1024 PNG.
 
 Writes $MAKEFUN_OUTPUT_DIR/entry.png (default /output/entry.png).
-No network, no third-party modules, deterministic: repeated runs write
-identical bytes.
+No network, no third-party modules, deterministic: repeated runs
+write identical bytes.
 
 Lead + six verified stories of 24 November 2026:
   Lead: Russian military jets enter South Korea's air defence zone
@@ -31,13 +31,13 @@ university shooting; India holds third in the Asia Power Index;
 Trump announces a Japan trade deal; South Africa votes.
 """
 
+import math
 import os
 import struct
 import zlib
 from pathlib import Path
 
-W = 1024
-H = 1024
+W, H = 1024, 1024
 
 PAPER = (248, 244, 233)
 INK = (18, 18, 18)
@@ -54,9 +54,9 @@ EMBER = (242, 172, 62)
 TEAL = (24, 118, 110)
 NIGHT = (24, 38, 68)
 
-# ---------------------------------------------------------------- font
+# ------------------------------------------------------------------ font
 # 5x7 pixel letters; '#' marks a filled cell.
-FONT = {
+GLYPHS = {
     'A': (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
     'B': ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
     'C': (".###.", "#...#", "#....", "#....", "#....", "#...#", ".###."),
@@ -114,27 +114,32 @@ FONT = {
     '*': (".....", "..#..", "#.#.#", ".###.", "#.#.#", "..#..", "....."),
 }
 
+BLANK = (".....",) * 7
 
-def text_w(s, k):
+
+def text_width(s, k):
+    """Pixel width of s rendered at scale k (6 px advance per glyph)."""
     return len(s) * 6 * k - k
 
 
-def wrap(s, n):
+def wrap_text(s, n):
     """Wrap a string into lines of at most n characters."""
-    out, cur = [], ""
+    lines, cur = [], ""
     for word in s.split():
         trial = word if not cur else cur + " " + word
         if len(trial) <= n:
             cur = trial
         else:
-            out.append(cur)
+            lines.append(cur)
             cur = word
     if cur:
-        out.append(cur)
-    return out
+        lines.append(cur)
+    return lines
 
 
-class Page:
+class Canvas:
+    """An RGB pixel buffer with tiny vector drawing helpers."""
+
     def __init__(self):
         self.px = bytearray(PAPER * (W * H))
 
@@ -148,13 +153,20 @@ class Page:
             for xx in range(x, x + w):
                 self.put(xx, yy, rgb)
 
-    def frame(self, x, y, w, h, rgb, t=3):
+    def hline(self, x, y, w, rgb, t=1):
         self.rect(x, y, w, t, rgb)
-        self.rect(x, y + h - t, w, t, rgb)
-        self.rect(x, y, t, h, rgb)
-        self.rect(x + w - t, y, t, h, rgb)
 
-    def line(self, x0, y0, x1, y1, rgb, t=2):
+    def vline(self, x, y, h, rgb, t=1):
+        self.rect(x, y, t, h, rgb)
+
+    def frame(self, x, y, w, h, rgb, t=3):
+        self.hline(x, y, w, rgb, t)
+        self.hline(x, y + h - t, w, rgb, t)
+        self.vline(x, y, h, rgb, t)
+        self.vline(x + w - t, y, h, rgb, t)
+
+    def segment(self, x0, y0, x1, y1, rgb, t=2):
+        """A straight line drawn as a chain of t x t blocks."""
         steps = max(abs(x1 - x0), abs(y1 - y0), 1)
         for i in range(steps + 1):
             x = x0 + (x1 - x0) * i // steps
@@ -168,179 +180,200 @@ class Page:
                     self.put(xx, yy, rgb)
 
     def ring(self, cx, cy, r, rgb, t=3):
+        lo = (r - t) ** 2
         for yy in range(cy - r - t, cy + r + t + 1):
             for xx in range(cx - r - t, cx + r + t + 1):
                 d = (xx - cx) ** 2 + (yy - cy) ** 2
-                if (r - t) ** 2 < d <= r * r:
+                if lo < d <= r * r:
                     self.put(xx, yy, rgb)
 
-    def tri(self, pts, rgb):
-        """Fill a triangle by scanlines."""
-        ys = sorted(p[1] for p in pts)
-        for y in range(ys[0], ys[2] + 1):
+    def triangle(self, pts, rgb):
+        """Fill a triangle by horizontal scanlines."""
+        (ax, ay), (bx, by), (cx, cy) = pts
+        top, bot = min(ay, by, cy), max(ay, by, cy)
+        edges = (((ax, ay), (bx, by)), ((bx, by), (cx, cy)),
+                 ((cx, cy), (ax, ay)))
+        for y in range(top, bot + 1):
             xs = []
-            for a, b in ((pts[0], pts[1]), (pts[1], pts[2]), (pts[2], pts[0])):
-                if a[1] == b[1]:
+            for (x0, y0), (x1, y1) in edges:
+                if y0 == y1 or not (min(y0, y1) <= y <= max(y0, y1)):
                     continue
-                if min(a[1], b[1]) <= y <= max(a[1], b[1]):
-                    t = (y - a[1]) / (b[1] - a[1])
-                    xs.append(a[0] + (b[0] - a[0]) * t)
+                f = (y - y0) / (y1 - y0)
+                xs.append(x0 + (x1 - x0) * f)
             if len(xs) >= 2:
                 for x in range(int(min(xs)), int(max(xs)) + 1):
                     self.put(x, y, rgb)
 
+    def glyph(self, x, y, ch, k, rgb):
+        rows = GLYPHS.get(ch, BLANK)
+        for r, row in enumerate(rows):
+            for c, cell in enumerate(row):
+                if cell == '#':
+                    self.rect(x + c * k, y + r * k, k, k, rgb)
+
     def text(self, x, y, s, k, rgb):
-        s = s.upper()
         cx = x
-        for ch in s:
-            glyph = FONT.get(ch, FONT[' '])
-            for r, row in enumerate(glyph):
-                for c, cell in enumerate(row):
-                    if cell == '#':
-                        self.rect(cx + c * k, y + r * k, k, k, rgb)
+        for ch in s.upper():
+            self.glyph(cx, y, ch, k, rgb)
             cx += 6 * k
         return cx
 
-    def text_c(self, y, s, k, rgb, cx=W // 2):
-        return self.text(cx - text_w(s, k) // 2, y, s, k, rgb)
+    def text_center(self, y, s, k, rgb, cx=W // 2):
+        return self.text(cx - text_width(s, k) // 2, y, s, k, rgb)
 
-    def text_r(self, x_end, y, s, k, rgb):
-        return self.text(x_end - text_w(s, k), y, s, k, rgb)
-
-
-# ---------------------------------------------------------------- lead
-def draw_jet(p, x, y, s, rgb):
-    """A small swept-wing jet silhouette pointing up-right."""
-    body = [(x, y - 26 * s), (x + 8 * s, y - 6 * s), (x + 6 * s, y + 14 * s),
-            (x + 2 * s, y + 10 * s), (x - 2 * s, y + 10 * s),
-            (x - 6 * s, y + 14 * s), (x - 8 * s, y - 6 * s)]
-    p.tri(body[:3], rgb)
-    p.tri([(x, y - 26 * s), (x - 8 * s, y - 6 * s), (x - 6 * s, y + 14 * s)], rgb)
-    p.tri([(x - 8 * s, y - 6 * s), (x - 26 * s, y + 4 * s), (x - 10 * s, y + 10 * s)], rgb)
-    p.tri([(x + 8 * s, y - 6 * s), (x + 26 * s, y + 4 * s), (x + 10 * s, y + 10 * s)], rgb)
-    p.tri([(x - 4 * s, y + 10 * s), (x + 4 * s, y + 10 * s), (x, y + 22 * s)], rgb)
+    def text_right(self, x_end, y, s, k, rgb):
+        return self.text(x_end - text_width(s, k), y, s, k, rgb)
 
 
-def draw_radar(p, cx, cy, r):
-    """Radar screen: rings, sweep, blips, and two jets closing in."""
-    p.disc(cx, cy, r, NIGHT)
+# ------------------------------------------------------------------- art
+def jet(c, x, y, s, rgb):
+    """Swept-wing jet silhouette, nose pointing up-right."""
+    nose = (x + 20 * s, y - 24 * s)
+    tail_l, tail_r = (x - 6 * s, y + 14 * s), (x + 8 * s, y + 12 * s)
+    c.triangle([nose, (x - 8 * s, y - 4 * s), tail_l], rgb)
+    c.triangle([nose, tail_r, (x + 10 * s, y - 2 * s)], rgb)
+    c.triangle([(x - 8 * s, y - 4 * s), (x - 28 * s, y + 6 * s),
+                (x - 10 * s, y + 10 * s)], rgb)
+    c.triangle([(x + 10 * s, y - 2 * s), (x + 28 * s, y + 8 * s),
+                (x + 10 * s, y + 12 * s)], rgb)
+    c.triangle([(x - 4 * s, y + 10 * s), (x + 6 * s, y + 10 * s),
+                (x + 2 * s, y + 24 * s)], rgb)
+
+
+def radar(c, cx, cy, r):
+    """Radar screen: concentric rings, cross-hairs, a dotted sweep arc,
+    three blips and two jets closing in on the island."""
+    c.disc(cx, cy, r, NIGHT)
     for rr in (r - 6, int(r * 0.66), int(r * 0.38)):
-        p.ring(cx, cy, rr, TEAL, 2)
-    p.line(cx - r, cy, cx + r, cy, TEAL, 2)
-    p.line(cx, cy - r, cx, cy + r, TEAL, 2)
-    p.ring(cx, cy, r, INK, 4)
-    # sweep wedge
-    for i in range(0, r, 3):
-        p.line(cx, cy, cx + int(i * 0.72), cy - int(i * 0.72), EMBER, 3)
-    # blips
-    p.disc(cx + 52, cy - 58, 6, RED)
-    p.disc(cx - 44, cy + 30, 5, RED)
-    p.disc(cx + 18, cy + 62, 5, EMBER)
-    draw_jet(p, cx - 58, cy - 62, 1, CREAM)
-    draw_jet(p, cx + 66, cy + 44, 1, EMBER)
+        c.ring(cx, cy, rr, TEAL, 2)
+    c.segment(cx - r, cy, cx + r, cy, TEAL, 2)
+    c.segment(cx, cy - r, cx, cy + r, TEAL, 2)
+    c.ring(cx, cy, r, INK, 4)
+    # dotted sweep arc, upper-right quadrant
+    for deg in range(0, 91, 6):
+        a = math.radians(deg)
+        for rr in (r - 18, r - 30, r - 42):
+            c.disc(cx + int(rr * math.cos(a)), cy - int(rr * math.sin(a)),
+                   3, EMBER)
+    c.disc(cx + 52, cy - 58, 6, RED)
+    c.disc(cx - 44, cy + 30, 5, RED)
+    c.disc(cx + 18, cy + 62, 5, EMBER)
+    jet(c, cx - 58, cy - 62, 1, CREAM)
+    jet(c, cx + 66, cy + 44, 1, EMBER)
 
 
-def draw_lead(p):
-    p.frame(28, 168, W - 56, 356, INK, 4)
-    p.rect(28, 168, W - 56, 52, RED)
-    p.text(48, 182, "KOREA ON ALERT", 4, CREAM)
-    p.text_r(W - 48, 182, "ULLEUNG ISLAND", 4, CREAM)
-    p.text(48, 238, "RUSSIAN JETS", 7, INK)
-    p.text(48, 296, "NEAR THE ISLAND", 7, INK)
-    body = ("Russian military aircraft enter South Korea's air defence "
-            "zone and close on Ulleung Island. Jets scramble, a 07:52 "
-            "air-raid alert tells islanders to take shelter, and the "
-            "alert lifts minutes later. Seoul says its airspace was "
-            "not violated and will summon Russia's attache.")
+# ------------------------------------------------------------------ story
+LEAD_BODY = (
+    "Russian military aircraft enter South Korea's air defence "
+    "zone and close on Ulleung Island. Jets scramble, a 07:52 "
+    "air-raid alert tells islanders to take shelter, and the "
+    "alert lifts minutes later. Seoul says its airspace was "
+    "not violated and will summon Russia's attache.")
+
+TILES = [
+    ("ANTALYA", "COP31 AFTERMATH: DEAL DEAD, TALKS LIVE ON",
+     "Erdogan: the failed summit laid a foundation for next "
+     "talks.", TEAL),
+    ("WASHINGTON", "US BLACKLISTS MEGASPEED IN NVIDIA SPY CASE",
+     "The Singapore firm in the Nvidia spy case joins the "
+     "Entity List.", BLUE),
+    ("KYIV", "ZELENSKY SEEKS FOUR-PARTY TALKS NOW",
+     "Kyiv is ready to meet as early as Tuesday.", GOLD),
+    ("INDONESIA", "FACTORY FIRE: SEARCH GOES ON FOR MISSING",
+     "Three dead, dozens missing as rescue teams keep "
+     "digging.", FIRE),
+    ("HIMALAYAS", "FLOOD: SCORES MISSING IN THE MOUNTAINS",
+     "At least four dead, about 100 missing after the "
+     "valley flood.", OCEAN),
+    ("OTTAWA", "PENTAGON REBUKES CANADA OVER F-35 REVIEW",
+     "Washington says Ottawa falls short as a partner in "
+     "defence.", RED),
+]
+
+FOOTER = [
+    "ALSO: UN CHIEF WANTS AN AI-REGULATION DEAL WITHIN A YEAR - CHINA",
+    "SENTENCES AN OFFICIAL TO DEATH FOR SPYING - TWO KILLED IN A US",
+    "UNIVERSITY SHOOTING - INDIA HOLDS THIRD IN ASIA POWER INDEX",
+]
+
+
+def draw_masthead(c):
+    c.text_center(26, "THE WORLD TODAY", 11, INK)
+    c.hline(28, 118, W - 56, INK, 5)
+    c.text(28, 132, "TUESDAY 24 NOVEMBER 2026", 3, INK)
+    c.text_right(W - 28, 132, "ONE IMAGE, THE DAY'S NEWS", 3, RED)
+    c.hline(28, 158, W - 56, INK, 3)
+
+
+def draw_lead(c):
+    c.frame(28, 168, W - 56, 356, INK, 4)
+    c.rect(28, 168, W - 56, 52, RED)
+    c.text(48, 182, "KOREA ON ALERT", 4, CREAM)
+    c.text_right(W - 48, 182, "ULLEUNG ISLAND", 4, CREAM)
+    c.text(48, 238, "RUSSIAN JETS", 7, INK)
+    c.text(48, 296, "NEAR THE ISLAND", 7, INK)
     y = 360
-    for ln in wrap(body, 52):
-        p.text(48, y, ln, 2, INK)
+    for ln in wrap_text(LEAD_BODY, 52):
+        c.text(48, y, ln, 2, INK)
         y += 21
-    draw_radar(p, 806, 372, 104)
+    radar(c, 806, 372, 104)
 
 
-# ---------------------------------------------------------------- tiles
-def tile(p, x, y, w, h, kicker, head, body, accent):
-    p.frame(x, y, w, h, INK, 3)
-    p.rect(x, y, w, 34, accent)
-    p.text(x + 12, y + 8, kicker, 3, CREAM)
+def draw_tile(c, x, y, w, h, kicker, head, body, accent):
+    c.frame(x, y, w, h, INK, 3)
+    c.rect(x, y, w, 34, accent)
+    c.text(x + 12, y + 8, kicker, 3, CREAM)
     yy = y + 46
-    for ln in wrap(head, 23):
-        p.text(x + 12, yy, ln, 2, INK)
+    for ln in wrap_text(head, 23):
+        c.text(x + 12, yy, ln, 2, INK)
         yy += 20
     yy += 4
-    for ln in wrap(body, 23):
-        p.text(x + 12, yy, ln, 2, GREY)
+    for ln in wrap_text(body, 23):
+        c.text(x + 12, yy, ln, 2, GREY)
         yy += 17
 
 
-def draw_tiles(p):
+def draw_grid(c):
     tw, th = 312, 168
     xs = (28, 356, 684)
     rows = (544, 728)
-    data = [
-        ("ANTALYA", "COP31 AFTERMATH: DEAL DEAD, TALKS LIVE ON",
-         "Erdogan: the failed summit laid a foundation for next "
-         "talks.", TEAL),
-        ("WASHINGTON", "US BLACKLISTS MEGASPEED IN NVIDIA SPY CASE",
-         "The Singapore firm in the Nvidia spy case joins the "
-         "Entity List.", BLUE),
-        ("KYIV", "ZELENSKY SEEKS FOUR-PARTY TALKS NOW",
-         "Kyiv is ready to meet as early as Tuesday.", GOLD),
-        ("INDONESIA", "FACTORY FIRE: SEARCH GOES ON FOR MISSING",
-         "Three dead, dozens missing as rescue teams keep "
-         "digging.", FIRE),
-        ("HIMALAYAS", "FLOOD: SCORES MISSING IN THE MOUNTAINS",
-         "At least four dead, about 100 missing after the "
-         "valley flood.", OCEAN),
-        ("OTTAWA", "PENTAGON REBUKES CANADA OVER F-35 REVIEW",
-         "Washington says Ottawa falls short as a partner in "
-         "defence.", RED),
-    ]
     i = 0
     for ry in rows:
         for rx in xs:
-            kicker, head, body, accent = data[i]
-            tile(p, rx, ry, tw, th, kicker, head, body, accent)
+            kicker, head, body, accent = TILES[i]
+            draw_tile(c, rx, ry, tw, th, kicker, head, body, accent)
             i += 1
 
 
-# ---------------------------------------------------------------- page
-def build():
-    p = Page()
-    # masthead
-    p.text_c(26, "THE WORLD TODAY", 11, INK)
-    p.rect(28, 118, W - 56, 5, INK)
-    p.text(28, 132, "TUESDAY 24 NOVEMBER 2026", 3, INK)
-    p.text_r(W - 28, 132, "ONE IMAGE, THE DAY'S NEWS", 3, RED)
-    p.rect(28, 158, W - 56, 3, INK)
-    draw_lead(p)
-    draw_tiles(p)
-    # footer strip
-    p.rect(28, 912, W - 56, 4, INK)
-    foot = [
-        "ALSO: UN CHIEF WANTS AN AI-REGULATION DEAL WITHIN A YEAR - CHINA",
-        "SENTENCES AN OFFICIAL TO DEATH FOR SPYING - TWO KILLED IN A US",
-        "UNIVERSITY SHOOTING - INDIA HOLDS THIRD IN ASIA POWER INDEX",
-    ]
+def draw_footer(c):
+    c.hline(28, 912, W - 56, INK, 4)
     y = 928
-    for ln in foot:
-        p.text_c(y, ln, 2, INK)
+    for ln in FOOTER:
+        c.text_center(y, ln, 2, INK)
         y += 24
-    p.rect(28, 1004, W - 56, 3, INK)
-    return p
+    c.hline(28, 1004, W - 56, INK, 3)
 
 
-def png_bytes(p):
+def build():
+    c = Canvas()
+    draw_masthead(c)
+    draw_lead(c)
+    draw_grid(c)
+    draw_footer(c)
+    return c
+
+
+# -------------------------------------------------------------------- png
+def png_bytes(c):
     raw = bytearray()
     rowlen = W * 3
     for y in range(H):
-        raw.append(0)
-        raw += p.px[y * rowlen:(y + 1) * rowlen]
+        raw.append(0)  # filter: none
+        raw += c.px[y * rowlen:(y + 1) * rowlen]
 
     def chunk(tag, data):
-        c = struct.pack(">I", len(data)) + tag + data
-        return c + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        out = struct.pack(">I", len(data)) + tag + data
+        return out + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
 
     ihdr = struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0)
     return (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr)
